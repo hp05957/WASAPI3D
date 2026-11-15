@@ -5,86 +5,483 @@
 #include <audioclient.h>
 #include <ks.h>
 #include <ksmedia.h>
-#include <PropIdl.h>
+#include <propidl.h>
 #include <cmath>
 #include <vector>
 #include <cstdio>
-
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "uuid.lib")
+#include <cstdarg>
 
 // ============================================================================
-// 1. LOGGING UTILITY
+// 1. THREAD-SAFE LOGGING & CRASH DIAGNOSTIC HANDLER
 // ============================================================================
 static CRITICAL_SECTION g_LogLock;
-static bool g_LogInit = false;
+static CRITICAL_SECTION g_HookLock;
+static volatile LONG g_LogInit = 0;
+static HMODULE g_hSelfModule = nullptr;
+
+static void InitLog() {
+    if (InterlockedCompareExchange(&g_LogInit, 1, 0) == 0) {
+        InitializeCriticalSection(&g_LogLock);
+        InitializeCriticalSection(&g_HookLock);
+        DeleteFileA("u4_spatial_proxy.log");
+    }
+}
 
 static void LogMsg(const char* fmt, ...) {
-    if (!g_LogInit) return;
+    if (InterlockedCompareExchange(&g_LogInit, 0, 0) == 0) return;
     EnterCriticalSection(&g_LogLock);
     FILE* f = fopen("u4_spatial_proxy.log", "a");
     if (f) {
+        DWORD tid = GetCurrentThreadId();
+        fprintf(f, "[T:%04X] ", (unsigned)tid);
         va_list args;
         va_start(args, fmt);
         vfprintf(f, fmt, args);
         va_end(args);
         fprintf(f, "\n");
+        fflush(f);
         fclose(f);
     }
     LeaveCriticalSection(&g_LogLock);
 }
 
+static LONG WINAPI CrashDiagnosticHandler(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+    // Ignore benign exceptions (OutputDebugString, thread naming, C++ exceptions, breakpoints)
+    if (code == 0x40010006 || code == 0x4001000A || code == 0x406D1388 ||
+        code == 0xE06D7363 || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    HMODULE hFaultMod = nullptr;
+    char modName[MAX_PATH] = " <unknown>";
+    uintptr_t faultAddr = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    uintptr_t modBase = 0;
+
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(faultAddr),
+            &hFaultMod) && hFaultMod)
+    {
+        modBase = reinterpret_cast<uintptr_t>(hFaultMod);
+        GetModuleFileNameA(hFaultMod, modName, MAX_PATH);
+    }
+
+    LogMsg("================================================================");
+    LogMsg("[CRASH] Exception 0x%08X at 0x%016llX (Module: %s + 0x%llX)",
+           (unsigned)code,
+           (unsigned long long)faultAddr,
+           modName,
+           (unsigned long long)(faultAddr - modBase));
+    if (ep->ExceptionRecord->NumberParameters >= 2) {
+        LogMsg("[CRASH] Access Type: %llu (0=Read, 1=Write, 8=Exec), Target Address: 0x%016llX",
+               (unsigned long long)ep->ExceptionRecord->ExceptionInformation[0],
+               (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    CONTEXT* c = ep->ContextRecord;
+    LogMsg("[CRASH] RIP=0x%016llX RSP=0x%016llX RBP=0x%016llX",
+           (unsigned long long)c->Rip, (unsigned long long)c->Rsp, (unsigned long long)c->Rbp);
+    LogMsg("[CRASH] RAX=0x%016llX RBX=0x%016llX RCX=0x%016llX RDX=0x%016llX",
+           (unsigned long long)c->Rax, (unsigned long long)c->Rbx, (unsigned long long)c->Rcx, (unsigned long long)c->Rdx);
+    LogMsg("[CRASH] RSI=0x%016llX RDI=0x%016llX R8 =0x%016llX R9 =0x%016llX",
+           (unsigned long long)c->Rsi, (unsigned long long)c->Rdi, (unsigned long long)c->R8, (unsigned long long)c->R9);
+    LogMsg("================================================================");
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // ============================================================================
-// 2. WINDOWS 10 SPATIAL AUDIO GUIDS, ENUMS & STRUCTURES
+// 2. GUID DEFINITIONS (WIN7 / WIN8 / WIN10 AUDIO INTERFACES)
 // ============================================================================
-// {DC8E63F3-D12B-4952-B47B-5E45026A862D} - Requested by u4.exe
-static const GUID IID_ISpatialAudioClient_U4 = 
+
+// {1CB9AD4C-DBFA-4c32-B178-C2F568A703B2} - IID_IAudioClient (Win7)
+static const GUID IID_IAudioClient_Win7 =
+    { 0x1CB9AD4C, 0xDBFA, 0x4c32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+
+// {726778CD-F60A-4EDA-82DE-E47610CD78AA} - IID_IAudioClient2 (Win8+)
+static const GUID IID_IAudioClient2_Win8 =
+    { 0x726778CD, 0xF60A, 0x4EDA, { 0x82, 0xDE, 0xE4, 0x76, 0x10, 0xCD, 0x78, 0xAA } };
+
+// {7ED4EE07-8E67-4CD4-8C1A-2B7A5987AD42} - IID_IAudioClient3 (Win10+)
+static const GUID IID_IAudioClient3_Win10 =
+    { 0x7ED4EE07, 0x8E67, 0x4CD4, { 0x8C, 0x1A, 0x2B, 0x7A, 0x59, 0x87, 0xAD, 0x42 } };
+
+// {F294ACFC-3146-4483-A7BF-ADDCA7C260E2} - IID_IAudioRenderClient
+static const GUID IID_IAudioRenderClient_Win7 =
+    { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
+
+// {BCDE0395-E52F-467C-8E3D-C4579291692E} - CLSID_MMDeviceEnumerator
+static const GUID CLSID_MMDeviceEnumerator_Win7 =
+    { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+
+// {A95664D2-9614-4F35-A746-DE8DB63617E6} - IID_IMMDeviceEnumerator
+static const GUID IID_IMMDeviceEnumerator_Win7 =
+    { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+
+// {DC8E63F3-D12B-4952-B47B-5E45026A862D} - Requested by u4.exe for SpatialAudio
+static const GUID IID_ISpatialAudioClient_U4 =
     { 0xDC8E63F3, 0xD12B, 0x4952, { 0xB4, 0x7B, 0x5E, 0x45, 0x02, 0x6A, 0x86, 0x2D } };
 
 // {BBF8E066-AAAA-49BE-9A4D-FD2A858EA27F} - Standard SDK IID_ISpatialAudioClient
-static const GUID IID_ISpatialAudioClient_SDK = 
+static const GUID IID_ISpatialAudioClient_SDK =
     { 0xBBF8E066, 0xAAAA, 0x49BE, { 0x9A, 0x4D, 0xFD, 0x2A, 0x85, 0x8E, 0xA2, 0x7F } };
 
 // {DCDAA858-895A-4A22-A5EB-67BDA506096D} - IID_IAudioFormatEnumerator
-static const GUID IID_IAudioFormatEnumerator_Custom = 
+static const GUID IID_IAudioFormatEnumerator_Custom =
     { 0xDCDAA858, 0x895A, 0x4A22, { 0xA5, 0xEB, 0x67, 0xBD, 0xA5, 0x06, 0x09, 0x6D } };
 
 // {BAB5F473-B423-477B-85F5-B5A332A04153} - IID_ISpatialAudioObjectRenderStream
-static const GUID IID_ISpatialAudioObjectRenderStream_Custom = 
+static const GUID IID_ISpatialAudioObjectRenderStream_Custom =
     { 0xBAB5F473, 0xB423, 0x477B, { 0x85, 0xF5, 0xB5, 0xA3, 0x32, 0xA0, 0x41, 0x53 } };
 
 // {2EAFEB77-B97A-4C7D-84F8-50797864549B} - IID_ISpatialAudioObjectRenderStreamBase
-static const GUID IID_ISpatialAudioObjectRenderStreamBase_Custom = 
+static const GUID IID_ISpatialAudioObjectRenderStreamBase_Custom =
     { 0x2EAFEB77, 0xB97A, 0x4C7D, { 0x84, 0xF8, 0x50, 0x79, 0x78, 0x64, 0x54, 0x9B } };
 
 // {DDE28967-521B-46E5-8F00-BD6F2BC8AB1D} - IID_ISpatialAudioObject
-static const GUID IID_ISpatialAudioObject_Custom = 
+static const GUID IID_ISpatialAudioObject_Custom =
     { 0xDDE28967, 0x521B, 0x46E5, { 0x8F, 0x00, 0xBD, 0x6F, 0x2B, 0xC8, 0xAB, 0x1D } };
 
 // {CCE0B8F2-8D4D-4EFB-A8CF-3D6ECF1C30E0} - IID_ISpatialAudioObjectBase
-static const GUID IID_ISpatialAudioObjectBase_Custom = 
+static const GUID IID_ISpatialAudioObjectBase_Custom =
     { 0xCCE0B8F2, 0x8D4D, 0x4EFB, { 0xA8, 0xCF, 0x3D, 0x6E, 0xCF, 0x1C, 0x30, 0xE0 } };
 
+// ============================================================================
+// 3. PER-VTABLE ORIGINAL POINTER REGISTRY (PREVENTS RECURSION & VTABLE MISMATCH)
+// ============================================================================
+struct VtableHookEntry {
+    void** vtable;
+    void* origSlot3;
+    void* origSlot4;
+    void* origSlot5;
+};
+
+static VtableHookEntry g_VtableHooks[64];
+static size_t g_VtableHookCount = 0;
+
+static VtableHookEntry* GetOrCreateVtableEntry(void** vtable) {
+    for (size_t i = 0; i < g_VtableHookCount; ++i) {
+        if (g_VtableHooks[i].vtable == vtable) {
+            return &g_VtableHooks[i];
+        }
+    }
+    if (g_VtableHookCount >= 64) return nullptr;
+    VtableHookEntry* entry = &g_VtableHooks[g_VtableHookCount++];
+    entry->vtable = vtable;
+    entry->origSlot3 = nullptr;
+    entry->origSlot4 = nullptr;
+    entry->origSlot5 = nullptr;
+    return entry;
+}
+
+static void* GetOrigVtableSlot(void* pThis, int slotIndex, void* fallbackFn) {
+    if (!pThis) return fallbackFn;
+    void** vtable = *reinterpret_cast<void***>(pThis);
+    if (!vtable) return fallbackFn;
+
+    EnterCriticalSection(&g_HookLock);
+    void* result = nullptr;
+    for (size_t i = 0; i < g_VtableHookCount; ++i) {
+        if (g_VtableHooks[i].vtable == vtable) {
+            if (slotIndex == 3) result = g_VtableHooks[i].origSlot3;
+            else if (slotIndex == 4) result = g_VtableHooks[i].origSlot4;
+            else if (slotIndex == 5) result = g_VtableHooks[i].origSlot5;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_HookLock);
+    return result ? result : fallbackFn;
+}
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_IMMDevice_Activate)(
+    IMMDevice* This, REFIID iid, DWORD dwClsCtx, PROPVARIANT* pActivationParams, void** ppInterface);
+static PFN_IMMDevice_Activate g_FallbackActivate = nullptr;
+
+// Thread-local flag so internal raw IAudioClient activations bypass the hook cleanly
+static __thread bool tls_BypassActivateHook = false;
+
+static HRESULT CallRealDeviceActivate(
+    IMMDevice* This,
+    REFIID iid,
+    DWORD dwClsCtx,
+    PROPVARIANT* pActivationParams,
+    void** ppInterface)
+{
+    PFN_IMMDevice_Activate origFn = reinterpret_cast<PFN_IMMDevice_Activate>(
+        GetOrigVtableSlot(This, 3, reinterpret_cast<void*>(g_FallbackActivate)));
+    if (!origFn) return E_FAIL;
+    tls_BypassActivateHook = true;
+    HRESULT hr = origFn(This, iid, dwClsCtx, pActivationParams, ppInterface);
+    tls_BypassActivateHook = false;
+    return hr;
+}
+
+// ============================================================================
+// 4. WINDOWS 8/10 IAUDIOCLIENT2 & IAUDIOCLIENT3 WRAPPER OVER WIN7 IAUDIOCLIENT
+// ============================================================================
+
+struct AudioClientProperties_Custom {
+    UINT32 cbSize;
+    BOOL bIsOffload;
+    int eCategory;
+    int Options;
+};
+
+struct IAudioClient3_Custom : public IAudioClient {
+    // IAudioClient2 methods (vtable indices 12..14)
+    virtual HRESULT STDMETHODCALLTYPE IsOffloadCapable(int Category, BOOL* pbOffloadCapable) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetClientProperties(const AudioClientProperties_Custom* pProperties) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetBufferSizeLimits(
+        const WAVEFORMATEX* pFormat,
+        BOOL bEventDriven,
+        REFERENCE_TIME* phnsMinBufferDuration,
+        REFERENCE_TIME* phnsMaxBufferDuration) = 0;
+
+    // IAudioClient3 methods (vtable indices 15..17)
+    virtual HRESULT STDMETHODCALLTYPE GetSharedModeEnginePeriod(
+        const WAVEFORMATEX* pFormat,
+        UINT32* pDefaultPeriodInFrames,
+        UINT32* pFundamentalPeriodInFrames,
+        UINT32* pMinPeriodInFrames,
+        UINT32* pMaxPeriodInFrames) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentSharedModeEnginePeriod(
+        WAVEFORMATEX** ppFormat,
+        UINT32* pCurrentPeriodInFrames) = 0;
+    virtual HRESULT STDMETHODCALLTYPE InitializeSharedAudioStream(
+        DWORD StreamFlags,
+        UINT32 PeriodInFrames,
+        const WAVEFORMATEX* pFormat,
+        LPCGUID AudioSessionGuid) = 0;
+};
+
+class FakeAudioClient23 : public IAudioClient3_Custom {
+    LONG m_refCount;
+    IAudioClient* m_real;
+
+public:
+    FakeAudioClient23(IAudioClient* realClient) : m_refCount(1), m_real(realClient) {
+        if (m_real) m_real->AddRef();
+    }
+
+    virtual ~FakeAudioClient23() {
+        if (m_real) m_real->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        if (riid == IID_IUnknown ||
+            riid == IID_IAudioClient_Win7 ||
+            riid == IID_IAudioClient2_Win8 ||
+            riid == IID_IAudioClient3_Win10) {
+            *ppvObject = static_cast<IAudioClient3_Custom*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return m_real ? m_real->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return InterlockedIncrement(&m_refCount);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG ref = InterlockedDecrement(&m_refCount);
+        if (ref == 0) delete this;
+        return ref;
+    }
+
+    HRESULT STDMETHODCALLTYPE Initialize(
+        AUDCLNT_SHAREMODE ShareMode,
+        DWORD StreamFlags,
+        REFERENCE_TIME hnsBufferDuration,
+        REFERENCE_TIME hnsPeriodicity,
+        const WAVEFORMATEX* pFormat,
+        LPCGUID AudioSessionGuid) override
+    {
+        // Strip AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM (0x80000000) & SRC_DEFAULT_QUALITY (0x08000000) if Win7 rejects them
+        DWORD cleanFlags = StreamFlags & ~(0x80000000 | 0x08000000 | 0x40000000);
+        HRESULT hr = m_real->Initialize(ShareMode, cleanFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
+        if (FAILED(hr)) {
+            // Try with original flags in case Win7 SP1 supports AUTOCONVERTPCM
+            hr = m_real->Initialize(ShareMode, StreamFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
+        }
+        if (FAILED(hr) && hnsBufferDuration < 300000) {
+            // Fallback if 10ms duration (100000) is smaller than Win7's minimum shared buffer
+            hr = m_real->Initialize(ShareMode, cleanFlags, 300000, hnsPeriodicity, pFormat, AudioSessionGuid);
+        }
+        LogMsg("[IAudioClient2/3] Initialize(ShareMode=%d, Flags=0x%X, Duration=%lld) -> 0x%08X",
+               (int)ShareMode, (unsigned)StreamFlags, (long long)hnsBufferDuration, (unsigned)hr);
+        return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBufferSize(UINT32* pNumBufferFrames) override {
+        return m_real->GetBufferSize(pNumBufferFrames);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetStreamLatency(REFERENCE_TIME* phnsLatency) override {
+        return m_real->GetStreamLatency(phnsLatency);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetCurrentPadding(UINT32* pNumPaddingFrames) override {
+        return m_real->GetCurrentPadding(pNumPaddingFrames);
+    }
+
+    HRESULT STDMETHODCALLTYPE IsFormatSupported(
+        AUDCLNT_SHAREMODE ShareMode,
+        const WAVEFORMATEX* pFormat,
+        WAVEFORMATEX** ppClosestMatch) override
+    {
+        return m_real->IsFormatSupported(ShareMode, pFormat, ppClosestMatch);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetMixFormat(WAVEFORMATEX** ppDeviceFormat) override {
+        return m_real->GetMixFormat(ppDeviceFormat);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDevicePeriod(
+        REFERENCE_TIME* phnsDefaultDevicePeriod,
+        REFERENCE_TIME* phnsMinimumDevicePeriod) override
+    {
+        return m_real->GetDevicePeriod(phnsDefaultDevicePeriod, phnsMinimumDevicePeriod);
+    }
+
+    HRESULT STDMETHODCALLTYPE Start(void) override {
+        LogMsg("[IAudioClient2/3] Start() called");
+        return m_real->Start();
+    }
+
+    HRESULT STDMETHODCALLTYPE Stop(void) override {
+        LogMsg("[IAudioClient2/3] Stop() called");
+        return m_real->Stop();
+    }
+
+    HRESULT STDMETHODCALLTYPE Reset(void) override {
+        LogMsg("[IAudioClient2/3] Reset() called");
+        return m_real->Reset();
+    }
+
+    HRESULT STDMETHODCALLTYPE SetEventHandle(HANDLE eventHandle) override {
+        LogMsg("[IAudioClient2/3] SetEventHandle(%p) called", eventHandle);
+        return m_real->SetEventHandle(eventHandle);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetService(REFIID riid, void** ppv) override {
+        HRESULT hr = m_real->GetService(riid, ppv);
+        LogMsg("[IAudioClient2/3] GetService(Data1=0x%08X) -> 0x%08X", (unsigned)riid.Data1, (unsigned)hr);
+        return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE IsOffloadCapable(int Category, BOOL* pbOffloadCapable) override {
+        if (!pbOffloadCapable) return E_POINTER;
+        *pbOffloadCapable = FALSE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetClientProperties(const AudioClientProperties_Custom* pProperties) override {
+        if (!pProperties) return E_POINTER;
+        LogMsg("[IAudioClient2/3] SetClientProperties(cbSize=%u, Category=%d, Options=0x%X) -> S_OK",
+               pProperties->cbSize, pProperties->eCategory, pProperties->Options);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBufferSizeLimits(
+        const WAVEFORMATEX* pFormat,
+        BOOL bEventDriven,
+        REFERENCE_TIME* phnsMinBufferDuration,
+        REFERENCE_TIME* phnsMaxBufferDuration) override
+    {
+        if (!phnsMinBufferDuration || !phnsMaxBufferDuration) return E_POINTER;
+        REFERENCE_TIME defPeriod = 100000, minPeriod = 30000;
+        if (m_real) {
+            m_real->GetDevicePeriod(&defPeriod, &minPeriod);
+        }
+        *phnsMinBufferDuration = defPeriod ? defPeriod : 100000;
+        *phnsMaxBufferDuration = 20000000;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSharedModeEnginePeriod(
+        const WAVEFORMATEX* pFormat,
+        UINT32* pDefaultPeriodInFrames,
+        UINT32* pFundamentalPeriodInFrames,
+        UINT32* pMinPeriodInFrames,
+        UINT32* pMaxPeriodInFrames) override
+    {
+        if (!pDefaultPeriodInFrames || !pFundamentalPeriodInFrames || !pMinPeriodInFrames || !pMaxPeriodInFrames)
+            return E_POINTER;
+
+        UINT32 sampleRate = (pFormat && pFormat->nSamplesPerSec) ? pFormat->nSamplesPerSec : 48000;
+        UINT32 frames = sampleRate / 100;
+        REFERENCE_TIME defPeriod = 0, minPeriod = 0;
+        if (m_real && SUCCEEDED(m_real->GetDevicePeriod(&defPeriod, &minPeriod)) && defPeriod > 0) {
+            frames = static_cast<UINT32>((defPeriod * sampleRate) / 10000000ULL);
+        }
+        if (frames == 0) frames = 480;
+
+        *pDefaultPeriodInFrames = frames;
+        *pFundamentalPeriodInFrames = 1;
+        *pMinPeriodInFrames = frames;
+        *pMaxPeriodInFrames = frames;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetCurrentSharedModeEnginePeriod(
+        WAVEFORMATEX** ppFormat,
+        UINT32* pCurrentPeriodInFrames) override
+    {
+        if (!ppFormat || !pCurrentPeriodInFrames) return E_POINTER;
+        HRESULT hr = m_real->GetMixFormat(ppFormat);
+        if (FAILED(hr) || !*ppFormat) return hr;
+
+        UINT32 sampleRate = (*ppFormat)->nSamplesPerSec ? (*ppFormat)->nSamplesPerSec : 48000;
+        UINT32 frames = sampleRate / 100;
+        REFERENCE_TIME defPeriod = 0, minPeriod = 0;
+        if (SUCCEEDED(m_real->GetDevicePeriod(&defPeriod, &minPeriod)) && defPeriod > 0) {
+            frames = static_cast<UINT32>((defPeriod * sampleRate) / 10000000ULL);
+        }
+        *pCurrentPeriodInFrames = frames ? frames : 480;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE InitializeSharedAudioStream(
+        DWORD StreamFlags,
+        UINT32 PeriodInFrames,
+        const WAVEFORMATEX* pFormat,
+        LPCGUID AudioSessionGuid) override
+    {
+        UINT32 sampleRate = (pFormat && pFormat->nSamplesPerSec) ? pFormat->nSamplesPerSec : 48000;
+        REFERENCE_TIME duration = (static_cast<REFERENCE_TIME>(PeriodInFrames) * 10000000ULL) / sampleRate;
+        if (duration < 200000) duration = 200000;
+        return Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, duration, 0, pFormat, AudioSessionGuid);
+    }
+};
+
+// ============================================================================
+// 5. WINDOWS 10 SPATIAL AUDIO STRUCTURES & INTERFACES
+// ============================================================================
+
 typedef enum AudioObjectType {
-    AudioObjectType_None            = 0,
-    AudioObjectType_Dynamic         = (1 << 0),
-    AudioObjectType_FrontLeft       = (1 << 1),
-    AudioObjectType_FrontRight      = (1 << 2),
-    AudioObjectType_FrontCenter     = (1 << 3),
-    AudioObjectType_LowFrequency    = (1 << 4),
-    AudioObjectType_SideLeft        = (1 << 5),
-    AudioObjectType_SideRight       = (1 << 6),
-    AudioObjectType_BackLeft        = (1 << 7),
-    AudioObjectType_BackRight       = (1 << 8),
-    AudioObjectType_TopFrontLeft    = (1 << 9),
-    AudioObjectType_TopFrontRight   = (1 << 10),
-    AudioObjectType_TopBackLeft     = (1 << 11),
-    AudioObjectType_TopBackRight    = (1 << 12),
-    AudioObjectType_BottomFrontLeft = (1 << 13),
-    AudioObjectType_BottomFrontRight= (1 << 14),
-    AudioObjectType_BottomBackLeft  = (1 << 15),
-    AudioObjectType_BottomBackRight = (1 << 16),
-    AudioObjectType_BackCenter      = (1 << 17)
+    AudioObjectType_None             = 0,
+    AudioObjectType_Dynamic          = (1 << 0),
+    AudioObjectType_FrontLeft        = (1 << 1),
+    AudioObjectType_FrontRight       = (1 << 2),
+    AudioObjectType_FrontCenter      = (1 << 3),
+    AudioObjectType_LowFrequency     = (1 << 4),
+    AudioObjectType_SideLeft         = (1 << 5),
+    AudioObjectType_SideRight        = (1 << 6),
+    AudioObjectType_BackLeft         = (1 << 7),
+    AudioObjectType_BackRight        = (1 << 8),
+    AudioObjectType_TopFrontLeft     = (1 << 9),
+    AudioObjectType_TopFrontRight    = (1 << 10),
+    AudioObjectType_TopBackLeft      = (1 << 11),
+    AudioObjectType_TopBackRight     = (1 << 12),
+    AudioObjectType_BottomFrontLeft  = (1 << 13),
+    AudioObjectType_BottomFrontRight = (1 << 14),
+    AudioObjectType_BottomBackLeft   = (1 << 15),
+    AudioObjectType_BottomBackRight  = (1 << 16),
+    AudioObjectType_BackCenter       = (1 << 17)
 } AudioObjectType;
 
 struct ISpatialAudioObjectRenderStreamNotify : public IUnknown {
@@ -92,8 +489,7 @@ struct ISpatialAudioObjectRenderStreamNotify : public IUnknown {
         IUnknown* sender, LONGLONG hnsComplianceDeadlineTime, UINT32 availableDynamicObjectCountChange) = 0;
 };
 
-#pragma pack(push, 1)
-struct SpatialAudioObjectRenderStreamActivationParams {
+struct SpatialAudioObjectRenderStreamActivationParams_Aligned {
     const WAVEFORMATEX* ObjectFormat;
     AudioObjectType StaticObjectTypeMask;
     UINT32 MinDynamicObjectCount;
@@ -103,39 +499,21 @@ struct SpatialAudioObjectRenderStreamActivationParams {
     ISpatialAudioObjectRenderStreamNotify* NotifyObject;
 };
 
-struct SpatialAudioObjectRenderStreamActivationParams2 {
-    const WAVEFORMATEX* ObjectFormat;
-    AudioObjectType StaticObjectTypeMask;
-    UINT32 MinDynamicObjectCount;
-    UINT32 MaxDynamicObjectCount;
-    int Category;
-    HANDLE EventHandle;
-    ISpatialAudioObjectRenderStreamNotify* NotifyObject;
-    int Options;
-};
-#pragma pack(pop)
-
-// ============================================================================
-// 3. EXACT VTABLE INTERFACES FOR WINDOWS 10 SPATIAL AUDIO
-// ============================================================================
 struct IAudioFormatEnumerator : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetCount(UINT32* count) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetFormat(UINT32 index, WAVEFORMATEX** format) = 0;
 };
 
 struct ISpatialAudioObject : public IUnknown {
-    // ISpatialAudioObjectBase
     virtual HRESULT STDMETHODCALLTYPE GetBuffer(BYTE** buffer, UINT32* bufferLength) = 0;
     virtual HRESULT STDMETHODCALLTYPE SetEndOfStream(UINT32 frameCount) = 0;
     virtual HRESULT STDMETHODCALLTYPE IsActive(BOOL* isActive) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetAudioObjectType(AudioObjectType* audioObjectType) = 0;
-    // ISpatialAudioObject
     virtual HRESULT STDMETHODCALLTYPE SetPosition(float x, float y, float z) = 0;
     virtual HRESULT STDMETHODCALLTYPE SetVolume(float volume) = 0;
 };
 
 struct ISpatialAudioObjectRenderStream : public IUnknown {
-    // ISpatialAudioObjectRenderStreamBase
     virtual HRESULT STDMETHODCALLTYPE GetAvailableDynamicObjectCount(UINT32* value) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetService(REFIID riid, void** service) = 0;
     virtual HRESULT STDMETHODCALLTYPE Start(void) = 0;
@@ -143,7 +521,6 @@ struct ISpatialAudioObjectRenderStream : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Reset(void) = 0;
     virtual HRESULT STDMETHODCALLTYPE BeginUpdatingAudioObjects(UINT32* availableDynamicObjectCount, UINT32* frameCountPerBuffer) = 0;
     virtual HRESULT STDMETHODCALLTYPE EndUpdatingAudioObjects(void) = 0;
-    // ISpatialAudioObjectRenderStream
     virtual HRESULT STDMETHODCALLTYPE ActivateSpatialAudioObject(AudioObjectType type, ISpatialAudioObject** audioObject) = 0;
 };
 
@@ -159,7 +536,7 @@ struct ISpatialAudioClient : public IUnknown {
 };
 
 // ============================================================================
-// 4. EMULATION IMPLEMENTATIONS (DOWNMIX TO WIN7 WASAPI)
+// 6. SPATIAL AUDIO EMULATION IMPLEMENTATIONS (DOWNMIX TO WIN7 WASAPI)
 // ============================================================================
 
 class FakeAudioFormatEnumerator : public IAudioFormatEnumerator {
@@ -168,13 +545,15 @@ class FakeAudioFormatEnumerator : public IAudioFormatEnumerator {
 public:
     FakeAudioFormatEnumerator(UINT32 sampleRate) : m_refCount(1) {
         m_format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        m_format.nChannels = 1; // Spatial audio objects are mono float streams
+        m_format.nChannels = 1;
         m_format.nSamplesPerSec = sampleRate ? sampleRate : 48000;
         m_format.wBitsPerSample = 32;
         m_format.nBlockAlign = 4;
         m_format.nAvgBytesPerSec = m_format.nSamplesPerSec * m_format.nBlockAlign;
         m_format.cbSize = 0;
     }
+
+    virtual ~FakeAudioFormatEnumerator() {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_POINTER;
@@ -221,9 +600,11 @@ public:
 
     FakeSpatialAudioObject(AudioObjectType type, UINT32 maxFrames)
         : m_refCount(1), m_type(type), m_x(0.0f), m_y(0.0f), m_z(0.0f),
-          m_volume(1.0f), m_isActive(TRUE), m_endOfStream(FALSE), m_validFrames(0) {
-        m_buffer.resize(maxFrames, 0.0f);
+          m_volume(1.0f), m_isActive(TRUE), m_endOfStream(FALSE), m_validFrames(480) {
+        m_buffer.resize(maxFrames ? maxFrames : 4096, 0.0f);
     }
+
+    virtual ~FakeSpatialAudioObject() {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_POINTER;
@@ -252,12 +633,15 @@ public:
             *bufferLength = 0;
             return S_OK;
         }
-        if (m_validFrames > m_buffer.size()) {
-            m_buffer.resize(m_validFrames, 0.0f);
+        UINT32 frames = m_validFrames;
+        if (frames > m_buffer.size()) {
+            m_buffer.resize(frames, 0.0f);
         }
-        memset(m_buffer.data(), 0, m_validFrames * sizeof(float));
+        if (frames > 0) {
+            memset(m_buffer.data(), 0, frames * sizeof(float));
+        }
         *buffer = reinterpret_cast<BYTE*>(m_buffer.data());
-        *bufferLength = m_validFrames * sizeof(float);
+        *bufferLength = frames * sizeof(float);
         return S_OK;
     }
 
@@ -304,7 +688,9 @@ class FakeSpatialAudioObjectRenderStream : public ISpatialAudioObjectRenderStrea
     CRITICAL_SECTION m_lock;
     std::vector<FakeSpatialAudioObject*> m_objects;
     UINT32 m_currentUpdateFrames;
-    bool m_running;
+    volatile LONG m_running;
+    bool m_loggedFirstUpdate;
+    bool m_loggedFirstObject;
 
     static DWORD WINAPI PumpThreadProc(LPVOID param) {
         FakeSpatialAudioObjectRenderStream* self = static_cast<FakeSpatialAudioObjectRenderStream*>(param);
@@ -314,7 +700,7 @@ class FakeSpatialAudioObjectRenderStream : public ISpatialAudioObjectRenderStrea
 
     void PumpLoop() {
         while (WaitForSingleObject(m_stopEvent, 10) == WAIT_TIMEOUT) {
-            if (m_running && m_gameEvent) {
+            if (InterlockedCompareExchange(&m_running, 0, 0) != 0 && m_gameEvent) {
                 SetEvent(m_gameEvent);
             }
         }
@@ -360,7 +746,7 @@ class FakeSpatialAudioObjectRenderStream : public ISpatialAudioObjectRenderStrea
                 float pan = (dist > 0.0001f) ? (obj->m_x / dist) : 0.0f;
                 if (pan < -1.0f) pan = -1.0f;
                 if (pan > 1.0f) pan = 1.0f;
-                float angle = (pan + 1.0f) * 0.78539816f; // (pan + 1) * (PI / 4)
+                float angle = (pan + 1.0f) * 0.78539816f;
                 outGainL = cosf(angle) * atten;
                 outGainR = sinf(angle) * atten;
                 break;
@@ -390,18 +776,21 @@ public:
           m_stopEvent(nullptr),
           m_pumpThread(nullptr),
           m_currentUpdateFrames(periodFrames),
-          m_running(false)
+          m_running(0),
+          m_loggedFirstUpdate(false),
+          m_loggedFirstObject(false)
     {
         InitializeCriticalSection(&m_lock);
         if (m_audioClient) m_audioClient->AddRef();
         if (m_renderClient) m_renderClient->AddRef();
 
-        // Fallback safety thread in case the game relies on manual event pulsing
         m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         m_pumpThread = CreateThread(nullptr, 0, PumpThreadProc, this, 0, nullptr);
     }
 
-    ~FakeSpatialAudioObjectRenderStream() {
+    virtual ~FakeSpatialAudioObjectRenderStream() {
+        LogMsg("[Stream] ~FakeSpatialAudioObjectRenderStream() destroying stream %p", this);
+        InterlockedExchange(&m_running, 0);
         if (m_stopEvent) SetEvent(m_stopEvent);
         if (m_pumpThread) {
             WaitForSingleObject(m_pumpThread, 500);
@@ -431,6 +820,7 @@ public:
             AddRef();
             return S_OK;
         }
+        LogMsg("[Stream] QueryInterface for unknown IID Data1=0x%08X", (unsigned)riid.Data1);
         *ppvObject = nullptr;
         return E_NOINTERFACE;
     }
@@ -457,25 +847,26 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetService(REFIID riid, void** service) override {
+        LogMsg("[Stream] GetService(Data1=0x%08X)", (unsigned)riid.Data1);
         if (!m_audioClient) return E_FAIL;
         return m_audioClient->GetService(riid, service);
     }
 
     HRESULT STDMETHODCALLTYPE Start(void) override {
-        LogMsg("[Stream] Start() called");
-        m_running = true;
+        LogMsg("[Stream] Start() called on %p", this);
+        InterlockedExchange(&m_running, 1);
         if (m_gameEvent) SetEvent(m_gameEvent);
         return m_audioClient ? m_audioClient->Start() : S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Stop(void) override {
-        LogMsg("[Stream] Stop() called");
-        m_running = false;
+        LogMsg("[Stream] Stop() called on %p", this);
+        InterlockedExchange(&m_running, 0);
         return m_audioClient ? m_audioClient->Stop() : S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Reset(void) override {
-        LogMsg("[Stream] Reset() called");
+        LogMsg("[Stream] Reset() called on %p", this);
         return m_audioClient ? m_audioClient->Reset() : S_OK;
     }
 
@@ -485,19 +876,10 @@ public:
     {
         EnterCriticalSection(&m_lock);
 
-        UINT32 padding = 0;
-        if (m_audioClient && SUCCEEDED(m_audioClient->GetCurrentPadding(&padding))) {
-            UINT32 avail = (m_bufferFrameCount > padding) ? (m_bufferFrameCount - padding) : 0;
-            if (avail == 0) {
-                m_currentUpdateFrames = 0;
-            } else if (avail > m_periodFrames) {
-                m_currentUpdateFrames = m_periodFrames;
-            } else {
-                m_currentUpdateFrames = avail;
-            }
-        } else {
-            m_currentUpdateFrames = m_periodFrames;
-        }
+        // Windows 10 Spatial Audio engines always expect a consistent period frame count
+        // (e.g., 480 frames = 10ms at 48kHz) during BeginUpdatingAudioObjects.
+        // Returning 0 when padding is full can cause divide-by-zero or null buffer crashes in game mixers!
+        m_currentUpdateFrames = m_periodFrames;
 
         UINT32 activeDyn = 0;
         for (size_t i = 0; i < m_objects.size(); ++i) {
@@ -515,6 +897,13 @@ public:
             *frameCountPerBuffer = m_currentUpdateFrames;
         }
 
+        if (!m_loggedFirstUpdate) {
+            m_loggedFirstUpdate = true;
+            LogMsg("[Stream] First BeginUpdatingAudioObjects(availDyn=%u, frames=%u)",
+                   (m_maxDynamicObjects > activeDyn) ? (m_maxDynamicObjects - activeDyn) : 0,
+                   m_currentUpdateFrames);
+        }
+
         LeaveCriticalSection(&m_lock);
         return S_OK;
     }
@@ -522,9 +911,18 @@ public:
     HRESULT STDMETHODCALLTYPE EndUpdatingAudioObjects(void) override {
         EnterCriticalSection(&m_lock);
 
-        if (m_currentUpdateFrames > 0 && m_renderClient && m_mixFormat) {
+        UINT32 padding = 0;
+        UINT32 availFrames = m_currentUpdateFrames;
+        if (m_audioClient && SUCCEEDED(m_audioClient->GetCurrentPadding(&padding))) {
+            UINT32 canWrite = (m_bufferFrameCount > padding) ? (m_bufferFrameCount - padding) : 0;
+            if (availFrames > canWrite) {
+                availFrames = canWrite;
+            }
+        }
+
+        if (availFrames > 0 && m_renderClient && m_mixFormat) {
             BYTE* pData = nullptr;
-            HRESULT hr = m_renderClient->GetBuffer(m_currentUpdateFrames, &pData);
+            HRESULT hr = m_renderClient->GetBuffer(availFrames, &pData);
             if (SUCCEEDED(hr) && pData) {
                 UINT32 channels = m_mixFormat->nChannels;
                 bool isFloat = (m_mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
@@ -537,7 +935,7 @@ public:
 
                 if (isFloat && channels >= 2) {
                     float* outFloat = reinterpret_cast<float*>(pData);
-                    memset(outFloat, 0, m_currentUpdateFrames * channels * sizeof(float));
+                    memset(outFloat, 0, availFrames * channels * sizeof(float));
 
                     for (size_t i = 0; i < m_objects.size(); ++i) {
                         FakeSpatialAudioObject* obj = m_objects[i];
@@ -546,8 +944,8 @@ public:
                         float gainL = 0.0f, gainR = 0.0f;
                         ComputeStereoGains(obj, gainL, gainR);
 
-                        UINT32 framesToMix = (obj->m_validFrames < m_currentUpdateFrames)
-                            ? obj->m_validFrames : m_currentUpdateFrames;
+                        UINT32 framesToMix = (obj->m_validFrames < availFrames)
+                            ? obj->m_validFrames : availFrames;
                         const float* inBuf = obj->m_buffer.data();
 
                         for (UINT32 f = 0; f < framesToMix; ++f) {
@@ -557,18 +955,16 @@ public:
                         }
                     }
 
-                    // Soft clip to prevent distortion when many objects sum together
-                    UINT32 totalSamples = m_currentUpdateFrames * channels;
+                    UINT32 totalSamples = availFrames * channels;
                     for (UINT32 s = 0; s < totalSamples; ++s) {
                         if (outFloat[s] > 1.0f) outFloat[s] = 1.0f;
                         else if (outFloat[s] < -1.0f) outFloat[s] = -1.0f;
                     }
                 } else if (m_mixFormat->wBitsPerSample == 16 && channels >= 2) {
-                    // Fallback 16-bit PCM downmix
                     short* outPcm = reinterpret_cast<short*>(pData);
-                    memset(outPcm, 0, m_currentUpdateFrames * channels * sizeof(short));
+                    memset(outPcm, 0, availFrames * channels * sizeof(short));
 
-                    for (UINT32 f = 0; f < m_currentUpdateFrames; ++f) {
+                    for (UINT32 f = 0; f < availFrames; ++f) {
                         float sumL = 0.0f, sumR = 0.0f;
                         for (size_t i = 0; i < m_objects.size(); ++i) {
                             FakeSpatialAudioObject* obj = m_objects[i];
@@ -585,14 +981,13 @@ public:
                         outPcm[f * channels + 1] = static_cast<short>(sumR * 32767.0f);
                     }
                 } else {
-                    memset(pData, 0, m_currentUpdateFrames * m_mixFormat->nBlockAlign);
+                    memset(pData, 0, availFrames * m_mixFormat->nBlockAlign);
                 }
 
-                m_renderClient->ReleaseBuffer(m_currentUpdateFrames, 0);
+                m_renderClient->ReleaseBuffer(availFrames, 0);
             }
         }
 
-        // Clean up objects marked EndOfStream
         for (size_t i = 0; i < m_objects.size(); ++i) {
             if (m_objects[i]->m_endOfStream) {
                 m_objects[i]->m_isActive = FALSE;
@@ -611,8 +1006,31 @@ public:
         if (!audioObject) return E_POINTER;
         EnterCriticalSection(&m_lock);
 
+        if (!m_loggedFirstObject) {
+            m_loggedFirstObject = true;
+            LogMsg("[Stream] First ActivateSpatialAudioObject(type=0x%X)", (unsigned)type);
+        }
+
+        if (type == AudioObjectType_Dynamic) {
+            for (size_t i = 0; i < m_objects.size(); ++i) {
+                if (!m_objects[i]->m_isActive && m_objects[i]->m_type == AudioObjectType_Dynamic) {
+                    FakeSpatialAudioObject* obj = m_objects[i];
+                    obj->m_isActive = TRUE;
+                    obj->m_endOfStream = FALSE;
+                    obj->m_validFrames = m_currentUpdateFrames ? m_currentUpdateFrames : m_periodFrames;
+                    obj->m_x = 0.0f; obj->m_y = 0.0f; obj->m_z = 0.0f;
+                    obj->m_volume = 1.0f;
+                    obj->AddRef();
+                    *audioObject = obj;
+                    LeaveCriticalSection(&m_lock);
+                    return S_OK;
+                }
+            }
+        }
+
         FakeSpatialAudioObject* obj = new FakeSpatialAudioObject(type, m_bufferFrameCount ? m_bufferFrameCount : 4096);
-        obj->AddRef(); // One ref for internal list, one ref returned to caller
+        obj->m_validFrames = m_currentUpdateFrames ? m_currentUpdateFrames : m_periodFrames;
+        obj->AddRef();
         m_objects.push_back(obj);
         *audioObject = obj;
 
@@ -627,6 +1045,11 @@ class FakeSpatialAudioClient : public ISpatialAudioClient {
     UINT32 m_nativeSampleRate;
     UINT32 m_periodFrames;
 
+    HRESULT ActivateRawAudioClient(IAudioClient** ppAudioClient) {
+        if (!m_device || !ppAudioClient) return E_POINTER;
+        return CallRealDeviceActivate(m_device, IID_IAudioClient_Win7, CLSCTX_ALL, nullptr, reinterpret_cast<void**>(ppAudioClient));
+    }
+
 public:
     FakeSpatialAudioClient(IMMDevice* device)
         : m_refCount(1), m_device(device), m_nativeSampleRate(48000), m_periodFrames(480)
@@ -634,21 +1057,27 @@ public:
         if (m_device) {
             m_device->AddRef();
             IAudioClient* tempClient = nullptr;
-            if (SUCCEEDED(m_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&tempClient)) && tempClient) {
+            HRESULT hr = ActivateRawAudioClient(&tempClient);
+            if (SUCCEEDED(hr) && tempClient) {
                 WAVEFORMATEX* mixFmt = nullptr;
                 if (SUCCEEDED(tempClient->GetMixFormat(&mixFmt)) && mixFmt) {
-                    m_nativeSampleRate = mixFmt->nSamplesPerSec;
-                    m_periodFrames = m_nativeSampleRate / 100; // 10ms period
+                    if (mixFmt->nSamplesPerSec > 0) {
+                        m_nativeSampleRate = mixFmt->nSamplesPerSec;
+                        m_periodFrames = m_nativeSampleRate / 100;
+                    }
                     CoTaskMemFree(mixFmt);
                 }
                 tempClient->Release();
+            } else {
+                LogMsg("[SpatialAudioClient] Note: ActivateRawAudioClient in ctor returned 0x%08X (using default 48kHz)", (unsigned)hr);
             }
         }
-        LogMsg("[SpatialAudioClient] Created (Native Sample Rate: %u Hz, Period: %u frames)",
-               m_nativeSampleRate, m_periodFrames);
+        LogMsg("[SpatialAudioClient] Created %p (Native Sample Rate: %u Hz, Period: %u frames)",
+               this, m_nativeSampleRate, m_periodFrames);
     }
 
-    ~FakeSpatialAudioClient() {
+    virtual ~FakeSpatialAudioClient() {
+        LogMsg("[SpatialAudioClient] ~FakeSpatialAudioClient() destroying %p", this);
         if (m_device) m_device->Release();
     }
 
@@ -661,6 +1090,7 @@ public:
             AddRef();
             return S_OK;
         }
+        LogMsg("[SpatialAudioClient] QueryInterface for unknown IID Data1=0x%08X", (unsigned)riid.Data1);
         *ppvObject = nullptr;
         return E_NOINTERFACE;
     }
@@ -699,28 +1129,32 @@ public:
             AudioObjectType_BackRight |
             AudioObjectType_SideLeft |
             AudioObjectType_SideRight);
+        LogMsg("[SpatialAudioClient] GetNativeStaticObjectTypeMask() -> 0x%X", (unsigned)*mask);
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetMaxDynamicObjectCount(UINT32* value) override {
         if (!value) return E_POINTER;
         *value = 128;
+        LogMsg("[SpatialAudioClient] GetMaxDynamicObjectCount() -> 128");
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetSupportedAudioObjectFormatEnumerator(IAudioFormatEnumerator** enumerator) override {
         if (!enumerator) return E_POINTER;
         *enumerator = new FakeAudioFormatEnumerator(m_nativeSampleRate);
+        LogMsg("[SpatialAudioClient] GetSupportedAudioObjectFormatEnumerator() -> S_OK");
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetMaxFrameCount(const WAVEFORMATEX* objectFormat, UINT32* frameCountPerBuffer) override {
         if (!frameCountPerBuffer) return E_POINTER;
         if (objectFormat && objectFormat->nSamplesPerSec > 0) {
-            *frameCountPerBuffer = objectFormat->nSamplesPerSec / 100; // 10ms
+            *frameCountPerBuffer = objectFormat->nSamplesPerSec / 100;
         } else {
             *frameCountPerBuffer = m_periodFrames;
         }
+        LogMsg("[SpatialAudioClient] GetMaxFrameCount() -> %u", *frameCountPerBuffer);
         return S_OK;
     }
 
@@ -730,6 +1164,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE IsSpatialAudioStreamAvailable(REFIID streamUuid, const PROPVARIANT* auxiliaryInfo) override {
+        LogMsg("[SpatialAudioClient] IsSpatialAudioStreamAvailable(Data1=0x%08X) -> S_OK", (unsigned)streamUuid.Data1);
         return S_OK;
     }
 
@@ -748,31 +1183,35 @@ public:
 
         if (activationParams && activationParams->vt == VT_BLOB &&
             activationParams->blob.pBlobData &&
-            activationParams->blob.cbSize >= sizeof(SpatialAudioObjectRenderStreamActivationParams))
+            activationParams->blob.cbSize >= sizeof(SpatialAudioObjectRenderStreamActivationParams_Aligned))
         {
-            const SpatialAudioObjectRenderStreamActivationParams* params =
-                reinterpret_cast<const SpatialAudioObjectRenderStreamActivationParams*>(activationParams->blob.pBlobData);
+            const SpatialAudioObjectRenderStreamActivationParams_Aligned* params =
+                reinterpret_cast<const SpatialAudioObjectRenderStreamActivationParams_Aligned*>(activationParams->blob.pBlobData);
             gameEvent = params->EventHandle;
             if (params->MaxDynamicObjectCount > 0) {
                 maxDynObjects = params->MaxDynamicObjectCount;
             }
-            LogMsg("[SpatialAudioClient] ActivationParams: MaxDynamic=%u, EventHandle=%p",
-                   maxDynObjects, gameEvent);
+            LogMsg("[SpatialAudioClient] ActivationParams: cbSize=%u, StaticMask=0x%X, MaxDynamic=%u, EventHandle=%p, NotifyObj=%p",
+                   (unsigned)activationParams->blob.cbSize,
+                   (unsigned)params->StaticObjectTypeMask,
+                   maxDynObjects,
+                   gameEvent,
+                   params->NotifyObject);
         }
 
         if (!m_device) return E_FAIL;
 
         IAudioClient* audioClient = nullptr;
-        HRESULT hr = m_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
+        HRESULT hr = ActivateRawAudioClient(&audioClient);
         if (FAILED(hr) || !audioClient) {
-            LogMsg("[SpatialAudioClient] ERROR: m_device->Activate(IAudioClient) failed: 0x%08X", hr);
+            LogMsg("[SpatialAudioClient] ERROR: ActivateRawAudioClient failed: 0x%08X", (unsigned)hr);
             return hr;
         }
 
         WAVEFORMATEX* mixFormat = nullptr;
         hr = audioClient->GetMixFormat(&mixFormat);
         if (FAILED(hr) || !mixFormat) {
-            LogMsg("[SpatialAudioClient] ERROR: GetMixFormat failed: 0x%08X", hr);
+            LogMsg("[SpatialAudioClient] ERROR: GetMixFormat failed: 0x%08X", (unsigned)hr);
             audioClient->Release();
             return hr;
         }
@@ -789,7 +1228,7 @@ public:
             nullptr);
 
         if (FAILED(hr) && initFlags != 0) {
-            LogMsg("[SpatialAudioClient] Event-driven init failed (0x%08X), retrying polling mode", hr);
+            LogMsg("[SpatialAudioClient] Event-driven init failed (0x%08X), retrying polling mode", (unsigned)hr);
             initFlags = 0;
             hr = audioClient->Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -801,7 +1240,7 @@ public:
         }
 
         if (FAILED(hr)) {
-            LogMsg("[SpatialAudioClient] ERROR: audioClient->Initialize failed: 0x%08X", hr);
+            LogMsg("[SpatialAudioClient] ERROR: audioClient->Initialize failed: 0x%08X", (unsigned)hr);
             CoTaskMemFree(mixFormat);
             audioClient->Release();
             return hr;
@@ -822,9 +1261,9 @@ public:
         if (periodFrames == 0) periodFrames = 480;
 
         IAudioRenderClient* renderClient = nullptr;
-        hr = audioClient->GetService(__uuidof(IAudioRenderClient), (void**)&renderClient);
+        hr = audioClient->GetService(IID_IAudioRenderClient_Win7, reinterpret_cast<void**>(&renderClient));
         if (FAILED(hr) || !renderClient) {
-            LogMsg("[SpatialAudioClient] ERROR: GetService(IAudioRenderClient) failed: 0x%08X", hr);
+            LogMsg("[SpatialAudioClient] ERROR: GetService(IAudioRenderClient) failed: 0x%08X", (unsigned)hr);
             CoTaskMemFree(mixFormat);
             audioClient->Release();
             return hr;
@@ -845,18 +1284,15 @@ public:
         hr = fakeStream->QueryInterface(riid, stream);
         fakeStream->Release();
 
-        LogMsg("[SpatialAudioClient] ActivateSpatialAudioStream() succeeded! Buffer=%u, Period=%u",
-               bufferFrameCount, periodFrames);
+        LogMsg("[SpatialAudioClient] ActivateSpatialAudioStream() succeeded! Stream=%p, Buffer=%u, Period=%u",
+               *stream, bufferFrameCount, periodFrames);
         return hr;
     }
 };
 
 // ============================================================================
-// 5. COM VTABLE & IAT HOOKS (CoCreateInstance -> IMMDeviceEnumerator -> IMMDevice)
+// 7. COM VTABLE & IAT HOOKS (PER-VTABLE SAFE HOOKS)
 // ============================================================================
-
-typedef HRESULT (STDMETHODCALLTYPE *PFN_IMMDevice_Activate)(
-    IMMDevice* This, REFIID iid, DWORD dwClsCtx, PROPVARIANT* pActivationParams, void** ppInterface);
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint)(
     IMMDeviceEnumerator* This, EDataFlow dataFlow, ERole role, IMMDevice** ppEndpoint);
@@ -870,11 +1306,10 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_IMMDeviceCollection_Item)(
 typedef HRESULT (STDMETHODCALLTYPE *PFN_IMMDeviceEnumerator_EnumAudioEndpoints)(
     IMMDeviceEnumerator* This, EDataFlow dataFlow, DWORD dwStateMask, IMMDeviceCollection** ppDevices);
 
-static PFN_IMMDevice_Activate g_OrigActivate = nullptr;
-static PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint g_OrigGetDefaultAudioEndpoint = nullptr;
-static PFN_IMMDeviceEnumerator_GetDevice g_OrigGetDevice = nullptr;
-static PFN_IMMDeviceCollection_Item g_OrigCollectionItem = nullptr;
-static PFN_IMMDeviceEnumerator_EnumAudioEndpoints g_OrigEnumAudioEndpoints = nullptr;
+static PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint g_FallbackGetDefaultAudioEndpoint = nullptr;
+static PFN_IMMDeviceEnumerator_GetDevice g_FallbackGetDevice = nullptr;
+static PFN_IMMDeviceCollection_Item g_FallbackCollectionItem = nullptr;
+static PFN_IMMDeviceEnumerator_EnumAudioEndpoints g_FallbackEnumAudioEndpoints = nullptr;
 
 static HRESULT STDMETHODCALLTYPE Hook_IMMDevice_Activate(
     IMMDevice* This,
@@ -883,13 +1318,40 @@ static HRESULT STDMETHODCALLTYPE Hook_IMMDevice_Activate(
     PROPVARIANT* pActivationParams,
     void** ppInterface)
 {
+    if (tls_BypassActivateHook) {
+        PFN_IMMDevice_Activate origFn = reinterpret_cast<PFN_IMMDevice_Activate>(
+            GetOrigVtableSlot(This, 3, reinterpret_cast<void*>(g_FallbackActivate)));
+        return origFn ? origFn(This, iid, dwClsCtx, pActivationParams, ppInterface) : E_FAIL;
+    }
+
+    // 1. Intercept Windows 10 ISpatialAudioClient
     if (iid == IID_ISpatialAudioClient_U4 || iid == IID_ISpatialAudioClient_SDK) {
-        LogMsg("[Hook] Intercepted IMMDevice::Activate for IID_ISpatialAudioClient!");
+        LogMsg("[Hook] Intercepted IMMDevice::Activate(This=%p) for IID_ISpatialAudioClient!", This);
         if (!ppInterface) return E_POINTER;
         *ppInterface = static_cast<ISpatialAudioClient*>(new FakeSpatialAudioClient(This));
         return S_OK;
     }
-    return g_OrigActivate(This, iid, dwClsCtx, pActivationParams, ppInterface);
+
+    // 2. Intercept IAudioClient / IAudioClient2 / IAudioClient3
+    if (iid == IID_IAudioClient_Win7 || iid == IID_IAudioClient2_Win8 || iid == IID_IAudioClient3_Win10) {
+        LogMsg("[Hook] Intercepted IMMDevice::Activate(This=%p) for IAudioClient/2/3 (Data1=0x%08X)", This, (unsigned)iid.Data1);
+        if (!ppInterface) return E_POINTER;
+        IAudioClient* realClient = nullptr;
+        HRESULT hr = CallRealDeviceActivate(This, IID_IAudioClient_Win7, dwClsCtx, pActivationParams, reinterpret_cast<void**>(&realClient));
+        if (SUCCEEDED(hr) && realClient) {
+            FakeAudioClient23* wrapper = new FakeAudioClient23(realClient);
+            realClient->Release();
+            hr = wrapper->QueryInterface(iid, ppInterface);
+            wrapper->Release();
+            LogMsg("[Hook] Wrapped Win7 IAudioClient into FakeAudioClient23 -> 0x%08X", (unsigned)hr);
+            return hr;
+        }
+        LogMsg("[Hook] ERROR: Underlying Win7 IAudioClient Activate failed -> 0x%08X", (unsigned)hr);
+        return hr;
+    }
+
+    LogMsg("[Hook] Pass-through IMMDevice::Activate(This=%p, IID Data1=0x%08X)", This, (unsigned)iid.Data1);
+    return CallRealDeviceActivate(This, iid, dwClsCtx, pActivationParams, ppInterface);
 }
 
 static void HookDeviceVtable(IMMDevice* pDevice) {
@@ -897,24 +1359,32 @@ static void HookDeviceVtable(IMMDevice* pDevice) {
     void** vtable = *reinterpret_cast<void***>(pDevice);
     if (!vtable) return;
 
-    // IMMDevice::Activate is vtable index 3
+    EnterCriticalSection(&g_HookLock);
+    VtableHookEntry* entry = GetOrCreateVtableEntry(vtable);
     if (vtable[3] != reinterpret_cast<void*>(&Hook_IMMDevice_Activate)) {
         DWORD oldProtect = 0;
         if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            if (!g_OrigActivate) {
-                g_OrigActivate = reinterpret_cast<PFN_IMMDevice_Activate>(vtable[3]);
+            if (entry && !entry->origSlot3) {
+                entry->origSlot3 = vtable[3];
+            }
+            if (!g_FallbackActivate) {
+                g_FallbackActivate = reinterpret_cast<PFN_IMMDevice_Activate>(vtable[3]);
             }
             vtable[3] = reinterpret_cast<void*>(&Hook_IMMDevice_Activate);
             VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
-            LogMsg("[Hook] Hooked IMMDevice::Activate at vtable[3]");
+            LogMsg("[Hook] Hooked IMMDevice::Activate at vtable %p (orig=%p)",
+                   vtable, entry ? entry->origSlot3 : nullptr);
         }
     }
+    LeaveCriticalSection(&g_HookLock);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_IMMDeviceCollection_Item(
     IMMDeviceCollection* This, UINT nDevice, IMMDevice** ppDevice)
 {
-    HRESULT hr = g_OrigCollectionItem(This, nDevice, ppDevice);
+    PFN_IMMDeviceCollection_Item origFn = reinterpret_cast<PFN_IMMDeviceCollection_Item>(
+        GetOrigVtableSlot(This, 4, reinterpret_cast<void*>(g_FallbackCollectionItem)));
+    HRESULT hr = origFn ? origFn(This, nDevice, ppDevice) : E_FAIL;
     if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
         HookDeviceVtable(*ppDevice);
     }
@@ -926,23 +1396,30 @@ static void HookDeviceCollectionVtable(IMMDeviceCollection* pCollection) {
     void** vtable = *reinterpret_cast<void***>(pCollection);
     if (!vtable) return;
 
-    // IMMDeviceCollection::Item is vtable index 4
+    EnterCriticalSection(&g_HookLock);
+    VtableHookEntry* entry = GetOrCreateVtableEntry(vtable);
     if (vtable[4] != reinterpret_cast<void*>(&Hook_IMMDeviceCollection_Item)) {
         DWORD oldProtect = 0;
         if (VirtualProtect(&vtable[4], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            if (!g_OrigCollectionItem) {
-                g_OrigCollectionItem = reinterpret_cast<PFN_IMMDeviceCollection_Item>(vtable[4]);
+            if (entry && !entry->origSlot4) {
+                entry->origSlot4 = vtable[4];
+            }
+            if (!g_FallbackCollectionItem) {
+                g_FallbackCollectionItem = reinterpret_cast<PFN_IMMDeviceCollection_Item>(vtable[4]);
             }
             vtable[4] = reinterpret_cast<void*>(&Hook_IMMDeviceCollection_Item);
             VirtualProtect(&vtable[4], sizeof(void*), oldProtect, &oldProtect);
         }
     }
+    LeaveCriticalSection(&g_HookLock);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_EnumAudioEndpoints(
     IMMDeviceEnumerator* This, EDataFlow dataFlow, DWORD dwStateMask, IMMDeviceCollection** ppDevices)
 {
-    HRESULT hr = g_OrigEnumAudioEndpoints(This, dataFlow, dwStateMask, ppDevices);
+    PFN_IMMDeviceEnumerator_EnumAudioEndpoints origFn = reinterpret_cast<PFN_IMMDeviceEnumerator_EnumAudioEndpoints>(
+        GetOrigVtableSlot(This, 3, reinterpret_cast<void*>(g_FallbackEnumAudioEndpoints)));
+    HRESULT hr = origFn ? origFn(This, dataFlow, dwStateMask, ppDevices) : E_FAIL;
     if (SUCCEEDED(hr) && ppDevices && *ppDevices) {
         HookDeviceCollectionVtable(*ppDevices);
     }
@@ -952,7 +1429,9 @@ static HRESULT STDMETHODCALLTYPE Hook_EnumAudioEndpoints(
 static HRESULT STDMETHODCALLTYPE Hook_GetDefaultAudioEndpoint(
     IMMDeviceEnumerator* This, EDataFlow dataFlow, ERole role, IMMDevice** ppEndpoint)
 {
-    HRESULT hr = g_OrigGetDefaultAudioEndpoint(This, dataFlow, role, ppEndpoint);
+    PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint origFn = reinterpret_cast<PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint>(
+        GetOrigVtableSlot(This, 4, reinterpret_cast<void*>(g_FallbackGetDefaultAudioEndpoint)));
+    HRESULT hr = origFn ? origFn(This, dataFlow, role, ppEndpoint) : E_FAIL;
     if (SUCCEEDED(hr) && ppEndpoint && *ppEndpoint) {
         HookDeviceVtable(*ppEndpoint);
     }
@@ -962,7 +1441,9 @@ static HRESULT STDMETHODCALLTYPE Hook_GetDefaultAudioEndpoint(
 static HRESULT STDMETHODCALLTYPE Hook_GetDevice(
     IMMDeviceEnumerator* This, LPCWSTR pwstrId, IMMDevice** ppDevice)
 {
-    HRESULT hr = g_OrigGetDevice(This, pwstrId, ppDevice);
+    PFN_IMMDeviceEnumerator_GetDevice origFn = reinterpret_cast<PFN_IMMDeviceEnumerator_GetDevice>(
+        GetOrigVtableSlot(This, 5, reinterpret_cast<void*>(g_FallbackGetDevice)));
+    HRESULT hr = origFn ? origFn(This, pwstrId, ppDevice) : E_FAIL;
     if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
         HookDeviceVtable(*ppDevice);
     }
@@ -974,29 +1455,31 @@ static void HookEnumeratorVtable(IMMDeviceEnumerator* pEnum) {
     void** vtable = *reinterpret_cast<void***>(pEnum);
     if (!vtable) return;
 
+    EnterCriticalSection(&g_HookLock);
+    VtableHookEntry* entry = GetOrCreateVtableEntry(vtable);
     DWORD oldProtect = 0;
     if (VirtualProtect(&vtable[3], sizeof(void*) * 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        // vtable[3]: EnumAudioEndpoints
         if (vtable[3] != reinterpret_cast<void*>(&Hook_EnumAudioEndpoints)) {
-            if (!g_OrigEnumAudioEndpoints)
-                g_OrigEnumAudioEndpoints = reinterpret_cast<PFN_IMMDeviceEnumerator_EnumAudioEndpoints>(vtable[3]);
+            if (entry && !entry->origSlot3) entry->origSlot3 = vtable[3];
+            if (!g_FallbackEnumAudioEndpoints)
+                g_FallbackEnumAudioEndpoints = reinterpret_cast<PFN_IMMDeviceEnumerator_EnumAudioEndpoints>(vtable[3]);
             vtable[3] = reinterpret_cast<void*>(&Hook_EnumAudioEndpoints);
         }
-        // vtable[4]: GetDefaultAudioEndpoint
         if (vtable[4] != reinterpret_cast<void*>(&Hook_GetDefaultAudioEndpoint)) {
-            if (!g_OrigGetDefaultAudioEndpoint)
-                g_OrigGetDefaultAudioEndpoint = reinterpret_cast<PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint>(vtable[4]);
+            if (entry && !entry->origSlot4) entry->origSlot4 = vtable[4];
+            if (!g_FallbackGetDefaultAudioEndpoint)
+                g_FallbackGetDefaultAudioEndpoint = reinterpret_cast<PFN_IMMDeviceEnumerator_GetDefaultAudioEndpoint>(vtable[4]);
             vtable[4] = reinterpret_cast<void*>(&Hook_GetDefaultAudioEndpoint);
         }
-        // vtable[5]: GetDevice
         if (vtable[5] != reinterpret_cast<void*>(&Hook_GetDevice)) {
-            if (!g_OrigGetDevice)
-                g_OrigGetDevice = reinterpret_cast<PFN_IMMDeviceEnumerator_GetDevice>(vtable[5]);
+            if (entry && !entry->origSlot5) entry->origSlot5 = vtable[5];
+            if (!g_FallbackGetDevice)
+                g_FallbackGetDevice = reinterpret_cast<PFN_IMMDeviceEnumerator_GetDevice>(vtable[5]);
             vtable[5] = reinterpret_cast<void*>(&Hook_GetDevice);
         }
         VirtualProtect(&vtable[3], sizeof(void*) * 3, oldProtect, &oldProtect);
-        LogMsg("[Hook] Hooked IMMDeviceEnumerator vtable");
     }
+    LeaveCriticalSection(&g_HookLock);
 }
 
 typedef HRESULT (WINAPI *PFN_CoCreateInstance)(
@@ -1012,10 +1495,9 @@ static HRESULT WINAPI Hook_CoCreateInstance(
     LPVOID* ppv)
 {
     HRESULT hr = g_OrigCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
-    if (SUCCEEDED(hr) && rclsid == __uuidof(MMDeviceEnumerator) && ppv && *ppv) {
-        LogMsg("[Hook] CoCreateInstance(CLSID_MMDeviceEnumerator) intercepted");
+    if (SUCCEEDED(hr) && rclsid == CLSID_MMDeviceEnumerator_Win7 && ppv && *ppv) {
         IMMDeviceEnumerator* pEnum = nullptr;
-        if (SUCCEEDED(static_cast<IUnknown*>(*ppv)->QueryInterface(__uuidof(IMMDeviceEnumerator), (void**)&pEnum)) && pEnum) {
+        if (SUCCEEDED(static_cast<IUnknown*>(*ppv)->QueryInterface(IID_IMMDeviceEnumerator_Win7, reinterpret_cast<void**>(&pEnum))) && pEnum) {
             HookEnumeratorVtable(pEnum);
             pEnum->Release();
         }
@@ -1067,12 +1549,15 @@ static void InstallCoCreateInstanceHooks() {
         g_OrigCoCreateInstance = reinterpret_cast<PFN_CoCreateInstance>(GetProcAddress(hOle32, "CoCreateInstance"));
     }
 
-    // Patch main executable (u4.exe) synchronously before WinMain starts
-    PatchModuleIAT(GetModuleHandleW(nullptr), "CoCreateInstance", reinterpret_cast<void*>(&Hook_CoCreateInstance), reinterpret_cast<void**>(&g_OrigCoCreateInstance));
+    PatchModuleIAT(
+        GetModuleHandleW(nullptr),
+        "CoCreateInstance",
+        reinterpret_cast<void*>(&Hook_CoCreateInstance),
+        reinterpret_cast<void**>(&g_OrigCoCreateInstance));
 }
 
 // ============================================================================
-// 6. REAL VERSION.DLL FORWARDERS
+// 8. REAL VERSION.DLL FORWARDERS
 // ============================================================================
 static HMODULE g_hRealVersion = nullptr;
 
@@ -1080,7 +1565,7 @@ static FARPROC GetVersionProc(const char* name) {
     if (!g_hRealVersion) {
         WCHAR sysDir[MAX_PATH];
         GetSystemDirectoryW(sysDir, MAX_PATH);
-        wcscat_s(sysDir, L"\\version.dll");
+        wcscat_s(sysDir, MAX_PATH, L"\\version.dll");
         g_hRealVersion = LoadLibraryW(sysDir);
     }
     return g_hRealVersion ? GetProcAddress(g_hRealVersion, name) : nullptr;
@@ -1193,25 +1678,18 @@ BOOL WINAPI Proxy_VerQueryValueW(LPCVOID pBlock, LPCWSTR lpSubBlock, LPVOID* lpl
 } // extern "C"
 
 // ============================================================================
-// 7. DLL ENTRY POINT
+// 9. DLL ENTRY POINT
 // ============================================================================
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        g_hSelfModule = hModule;
         DisableThreadLibraryCalls(hModule);
-        InitializeCriticalSection(&g_LogLock);
-        g_LogInit = true;
-        DeleteFileA("u4_spatial_proxy.log");
-        LogMsg("=== Uncharted 4 Win7 SpatialAudio Proxy Loaded ===");
+        InitLog();
+        AddVectoredExceptionHandler(1, CrashDiagnosticHandler);
+        LogMsg("=== Uncharted 4 Win7 SpatialAudio + IAudioClient2/3 Proxy v3 Loaded (Base=%p) ===", hModule);
         InstallCoCreateInstanceHooks();
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        if (g_hRealVersion) {
-            FreeLibrary(g_hRealVersion);
-            g_hRealVersion = nullptr;
-        }
-        if (g_LogInit) {
-            g_LogInit = false;
-            DeleteCriticalSection(&g_LogLock);
-        }
+        LogMsg("=== Uncharted 4 Win7 Proxy v3 Unloading ===");
     }
     return TRUE;
 }
