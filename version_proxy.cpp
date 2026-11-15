@@ -49,7 +49,6 @@ static LONG WINAPI CrashDiagnosticHandler(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
 
-    // Ignore benign exceptions (OutputDebugString, thread naming, C++ exceptions, breakpoints)
     if (code == 0x40010006 || code == 0x4001000A || code == 0x406D1388 ||
         code == 0xE06D7363 || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -92,9 +91,23 @@ static LONG WINAPI CrashDiagnosticHandler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Dynamic winmm timer helpers (no -lwinmm required at link time)
+static void SetHighResTimer(bool enable) {
+    typedef UINT (WINAPI *PFN_timePeriod)(UINT);
+    static HMODULE hWinMM = LoadLibraryW(L"winmm.dll");
+    static PFN_timePeriod pBegin = hWinMM ? reinterpret_cast<PFN_timePeriod>(GetProcAddress(hWinMM, "timeBeginPeriod")) : nullptr;
+    static PFN_timePeriod pEnd   = hWinMM ? reinterpret_cast<PFN_timePeriod>(GetProcAddress(hWinMM, "timeEndPeriod"))   : nullptr;
+    if (enable && pBegin) pBegin(1);
+    else if (!enable && pEnd) pEnd(1);
+}
+
 // ============================================================================
 // 2. GUID DEFINITIONS (WIN7 / WIN8 / WIN10 AUDIO INTERFACES)
 // ============================================================================
+
+// {D666063F-1587-4E43-81F1-B948E807363F} - IID_IMMDevice
+static const GUID IID_IMMDevice_Win7 =
+    { 0xD666063F, 0x1587, 0x4E43, { 0x81, 0xF1, 0xB9, 0x48, 0xE8, 0x07, 0x36, 0x3F } };
 
 // {1CB9AD4C-DBFA-4c32-B178-C2F568A703B2} - IID_IAudioClient (Win7)
 static const GUID IID_IAudioClient_Win7 =
@@ -149,7 +162,7 @@ static const GUID IID_ISpatialAudioObjectBase_Custom =
     { 0xCCE0B8F2, 0x8D4D, 0x4EFB, { 0xA8, 0xCF, 0x3D, 0x6E, 0xCF, 0x1C, 0x30, 0xE0 } };
 
 // ============================================================================
-// 3. PER-VTABLE ORIGINAL POINTER REGISTRY (PREVENTS RECURSION & VTABLE MISMATCH)
+// 3. PER-VTABLE ORIGINAL POINTER REGISTRY
 // ============================================================================
 struct VtableHookEntry {
     void** vtable;
@@ -199,7 +212,6 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_IMMDevice_Activate)(
     IMMDevice* This, REFIID iid, DWORD dwClsCtx, PROPVARIANT* pActivationParams, void** ppInterface);
 static PFN_IMMDevice_Activate g_FallbackActivate = nullptr;
 
-// Thread-local flag so internal raw IAudioClient activations bypass the hook cleanly
 static __thread bool tls_BypassActivateHook = false;
 
 static HRESULT CallRealDeviceActivate(
@@ -230,7 +242,6 @@ struct AudioClientProperties_Custom {
 };
 
 struct IAudioClient3_Custom : public IAudioClient {
-    // IAudioClient2 methods (vtable indices 12..14)
     virtual HRESULT STDMETHODCALLTYPE IsOffloadCapable(int Category, BOOL* pbOffloadCapable) = 0;
     virtual HRESULT STDMETHODCALLTYPE SetClientProperties(const AudioClientProperties_Custom* pProperties) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetBufferSizeLimits(
@@ -239,7 +250,6 @@ struct IAudioClient3_Custom : public IAudioClient {
         REFERENCE_TIME* phnsMinBufferDuration,
         REFERENCE_TIME* phnsMaxBufferDuration) = 0;
 
-    // IAudioClient3 methods (vtable indices 15..17)
     virtual HRESULT STDMETHODCALLTYPE GetSharedModeEnginePeriod(
         const WAVEFORMATEX* pFormat,
         UINT32* pDefaultPeriodInFrames,
@@ -300,16 +310,13 @@ public:
         const WAVEFORMATEX* pFormat,
         LPCGUID AudioSessionGuid) override
     {
-        // Strip AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM (0x80000000) & SRC_DEFAULT_QUALITY (0x08000000) if Win7 rejects them
-        DWORD cleanFlags = StreamFlags & ~(0x80000000 | 0x08000000 | 0x40000000);
-        HRESULT hr = m_real->Initialize(ShareMode, cleanFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
+        HRESULT hr = m_real->Initialize(ShareMode, StreamFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
         if (FAILED(hr)) {
-            // Try with original flags in case Win7 SP1 supports AUTOCONVERTPCM
-            hr = m_real->Initialize(ShareMode, StreamFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
-        }
-        if (FAILED(hr) && hnsBufferDuration < 300000) {
-            // Fallback if 10ms duration (100000) is smaller than Win7's minimum shared buffer
-            hr = m_real->Initialize(ShareMode, cleanFlags, 300000, hnsPeriodicity, pFormat, AudioSessionGuid);
+            DWORD cleanFlags = StreamFlags & ~(0x80000000 | 0x08000000 | 0x40000000);
+            hr = m_real->Initialize(ShareMode, cleanFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
+            if (FAILED(hr) && hnsBufferDuration < 200000) {
+                hr = m_real->Initialize(ShareMode, cleanFlags, 200000, hnsPeriodicity, pFormat, AudioSessionGuid);
+            }
         }
         LogMsg("[IAudioClient2/3] Initialize(ShareMode=%d, Flags=0x%X, Duration=%lld) -> 0x%08X",
                (int)ShareMode, (unsigned)StreamFlags, (long long)hnsBufferDuration, (unsigned)hr);
@@ -541,16 +548,19 @@ struct ISpatialAudioClient : public IUnknown {
 
 class FakeAudioFormatEnumerator : public IAudioFormatEnumerator {
     LONG m_refCount;
-    WAVEFORMATEX m_format;
+    WAVEFORMATEX* m_format;
 public:
-    FakeAudioFormatEnumerator(UINT32 sampleRate) : m_refCount(1) {
-        m_format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        m_format.nChannels = 1;
-        m_format.nSamplesPerSec = sampleRate ? sampleRate : 48000;
-        m_format.wBitsPerSample = 32;
-        m_format.nBlockAlign = 4;
-        m_format.nAvgBytesPerSec = m_format.nSamplesPerSec * m_format.nBlockAlign;
-        m_format.cbSize = 0;
+    FakeAudioFormatEnumerator(UINT32 sampleRate) : m_refCount(1), m_format(nullptr) {
+        m_format = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+        if (m_format) {
+            m_format->wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+            m_format->nChannels = 1;
+            m_format->nSamplesPerSec = sampleRate ? sampleRate : 48000;
+            m_format->wBitsPerSample = 32;
+            m_format->nBlockAlign = 4;
+            m_format->nAvgBytesPerSec = m_format->nSamplesPerSec * m_format->nBlockAlign;
+            m_format->cbSize = 0;
+        }
     }
 
     virtual ~FakeAudioFormatEnumerator() {}
@@ -581,8 +591,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetFormat(UINT32 index, WAVEFORMATEX** format) override {
         if (!format) return E_POINTER;
-        if (index != 0) return E_INVALIDARG;
-        *format = &m_format;
+        if (index != 0 || !m_format) return E_INVALIDARG;
+        *format = m_format;
         return S_OK;
     }
 };
@@ -637,9 +647,6 @@ public:
         if (frames > m_buffer.size()) {
             m_buffer.resize(frames, 0.0f);
         }
-        if (frames > 0) {
-            memset(m_buffer.data(), 0, frames * sizeof(float));
-        }
         *buffer = reinterpret_cast<BYTE*>(m_buffer.data());
         *bufferLength = frames * sizeof(float);
         return S_OK;
@@ -689,6 +696,7 @@ class FakeSpatialAudioObjectRenderStream : public ISpatialAudioObjectRenderStrea
     std::vector<FakeSpatialAudioObject*> m_objects;
     UINT32 m_currentUpdateFrames;
     volatile LONG m_running;
+    volatile LONG m_inUpdate;
     bool m_loggedFirstUpdate;
     bool m_loggedFirstObject;
 
@@ -699,11 +707,47 @@ class FakeSpatialAudioObjectRenderStream : public ISpatialAudioObjectRenderStrea
     }
 
     void PumpLoop() {
-        while (WaitForSingleObject(m_stopEvent, 10) == WAIT_TIMEOUT) {
-            if (InterlockedCompareExchange(&m_running, 0, 0) != 0 && m_gameEvent) {
-                SetEvent(m_gameEvent);
+        SetHighResTimer(true);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+        LARGE_INTEGER freq = {}, lastTick = {}, now = {};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&lastTick);
+
+        UINT32 sampleRate = (m_mixFormat && m_mixFormat->nSamplesPerSec) ? m_mixFormat->nSamplesPerSec : 48000;
+        LONGLONG periodTicks = (freq.QuadPart * static_cast<LONGLONG>(m_periodFrames)) / sampleRate;
+        if (periodTicks <= 0) periodTicks = freq.QuadPart / 100; // 10ms fallback
+
+        while (WaitForSingleObject(m_stopEvent, 1) == WAIT_TIMEOUT) {
+            if (InterlockedCompareExchange(&m_running, 0, 0) == 0 || !m_gameEvent) {
+                QueryPerformanceCounter(&lastTick);
+                continue;
+            }
+            if (InterlockedCompareExchange(&m_inUpdate, 0, 0) != 0) {
+                continue;
+            }
+
+            QueryPerformanceCounter(&now);
+            if ((now.QuadPart - lastTick.QuadPart) >= periodTicks) {
+                UINT32 padding = 0;
+                EnterCriticalSection(&m_lock);
+                HRESULT hr = m_audioClient ? m_audioClient->GetCurrentPadding(&padding) : E_FAIL;
+                LeaveCriticalSection(&m_lock);
+
+                if (SUCCEEDED(hr)) {
+                    UINT32 canWrite = (m_bufferFrameCount > padding) ? (m_bufferFrameCount - padding) : 0;
+                    if (canWrite >= m_periodFrames) {
+                        lastTick.QuadPart += periodTicks;
+                        if ((now.QuadPart - lastTick.QuadPart) > periodTicks * 2) {
+                            lastTick = now;
+                        }
+                        SetEvent(m_gameEvent);
+                    }
+                }
             }
         }
+
+        SetHighResTimer(false);
     }
 
     static void ComputeStereoGains(FakeSpatialAudioObject* obj, float& outGainL, float& outGainR) {
@@ -777,6 +821,7 @@ public:
           m_pumpThread(nullptr),
           m_currentUpdateFrames(periodFrames),
           m_running(0),
+          m_inUpdate(0),
           m_loggedFirstUpdate(false),
           m_loggedFirstObject(false)
     {
@@ -854,31 +899,38 @@ public:
 
     HRESULT STDMETHODCALLTYPE Start(void) override {
         LogMsg("[Stream] Start() called on %p", this);
+        EnterCriticalSection(&m_lock);
+        HRESULT hr = m_audioClient ? m_audioClient->Start() : S_OK;
+        LeaveCriticalSection(&m_lock);
         InterlockedExchange(&m_running, 1);
         if (m_gameEvent) SetEvent(m_gameEvent);
-        return m_audioClient ? m_audioClient->Start() : S_OK;
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE Stop(void) override {
         LogMsg("[Stream] Stop() called on %p", this);
         InterlockedExchange(&m_running, 0);
-        return m_audioClient ? m_audioClient->Stop() : S_OK;
+        EnterCriticalSection(&m_lock);
+        HRESULT hr = m_audioClient ? m_audioClient->Stop() : S_OK;
+        LeaveCriticalSection(&m_lock);
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE Reset(void) override {
         LogMsg("[Stream] Reset() called on %p", this);
-        return m_audioClient ? m_audioClient->Reset() : S_OK;
+        EnterCriticalSection(&m_lock);
+        HRESULT hr = m_audioClient ? m_audioClient->Reset() : S_OK;
+        LeaveCriticalSection(&m_lock);
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE BeginUpdatingAudioObjects(
         UINT32* availableDynamicObjectCount,
         UINT32* frameCountPerBuffer) override
     {
+        InterlockedExchange(&m_inUpdate, 1);
         EnterCriticalSection(&m_lock);
 
-        // Windows 10 Spatial Audio engines always expect a consistent period frame count
-        // (e.g., 480 frames = 10ms at 48kHz) during BeginUpdatingAudioObjects.
-        // Returning 0 when padding is full can cause divide-by-zero or null buffer crashes in game mixers!
         m_currentUpdateFrames = m_periodFrames;
 
         UINT32 activeDyn = 0;
@@ -886,6 +938,10 @@ public:
             FakeSpatialAudioObject* obj = m_objects[i];
             if (obj->m_isActive) {
                 obj->m_validFrames = m_currentUpdateFrames;
+                if (obj->m_buffer.size() < m_currentUpdateFrames) {
+                    obj->m_buffer.resize(m_currentUpdateFrames, 0.0f);
+                }
+                memset(obj->m_buffer.data(), 0, m_currentUpdateFrames * sizeof(float));
                 if (obj->m_type == AudioObjectType_Dynamic) activeDyn++;
             }
         }
@@ -909,6 +965,21 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE EndUpdatingAudioObjects(void) override {
+        // Wait until WASAPI hardware buffer has drained enough to accept the full
+        // m_currentUpdateFrames (480 frames = 10ms). This locks the game's audio mixer
+        // 1:1 to the sound card's hardware clock so it can never run faster than 1.0x!
+        for (int waitIter = 0; waitIter < 25; ++waitIter) {
+            if (InterlockedCompareExchange(&m_running, 0, 0) == 0) break;
+            UINT32 padding = 0;
+            EnterCriticalSection(&m_lock);
+            HRESULT hr = m_audioClient ? m_audioClient->GetCurrentPadding(&padding) : E_FAIL;
+            LeaveCriticalSection(&m_lock);
+            if (FAILED(hr)) break;
+            UINT32 canWrite = (m_bufferFrameCount > padding) ? (m_bufferFrameCount - padding) : 0;
+            if (canWrite >= m_currentUpdateFrames) break;
+            Sleep(1);
+        }
+
         EnterCriticalSection(&m_lock);
 
         UINT32 padding = 0;
@@ -996,6 +1067,7 @@ public:
         }
 
         LeaveCriticalSection(&m_lock);
+        InterlockedExchange(&m_inUpdate, 0);
         return S_OK;
     }
 
@@ -1020,6 +1092,7 @@ public:
                     obj->m_validFrames = m_currentUpdateFrames ? m_currentUpdateFrames : m_periodFrames;
                     obj->m_x = 0.0f; obj->m_y = 0.0f; obj->m_z = 0.0f;
                     obj->m_volume = 1.0f;
+                    memset(obj->m_buffer.data(), 0, obj->m_buffer.size() * sizeof(float));
                     obj->AddRef();
                     *audioObject = obj;
                     LeaveCriticalSection(&m_lock);
@@ -1216,20 +1289,18 @@ public:
             return hr;
         }
 
-        DWORD initFlags = gameEvent ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0;
-        REFERENCE_TIME hnsBufferDuration = 300000; // 30ms buffer
+        REFERENCE_TIME hnsBufferDuration = 200000; // 20ms buffer
 
         hr = audioClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            initFlags,
+            0,
             hnsBufferDuration,
             0,
             mixFormat,
             nullptr);
 
-        if (FAILED(hr) && initFlags != 0) {
-            LogMsg("[SpatialAudioClient] Event-driven init failed (0x%08X), retrying polling mode", (unsigned)hr);
-            initFlags = 0;
+        if (FAILED(hr)) {
+            hnsBufferDuration = 300000; // Fallback 30ms buffer
             hr = audioClient->Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 0,
@@ -1244,10 +1315,6 @@ public:
             CoTaskMemFree(mixFormat);
             audioClient->Release();
             return hr;
-        }
-
-        if ((initFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && gameEvent) {
-            audioClient->SetEventHandle(gameEvent);
         }
 
         UINT32 bufferFrameCount = 0;
@@ -1350,33 +1417,41 @@ static HRESULT STDMETHODCALLTYPE Hook_IMMDevice_Activate(
         return hr;
     }
 
-    LogMsg("[Hook] Pass-through IMMDevice::Activate(This=%p, IID Data1=0x%08X)", This, (unsigned)iid.Data1);
     return CallRealDeviceActivate(This, iid, dwClsCtx, pActivationParams, ppInterface);
 }
 
-static void HookDeviceVtable(IMMDevice* pDevice) {
-    if (!pDevice) return;
-    void** vtable = *reinterpret_cast<void***>(pDevice);
-    if (!vtable) return;
+static void HookDeviceVtable(IMMDevice* pDeviceIn) {
+    if (!pDeviceIn) return;
 
-    EnterCriticalSection(&g_HookLock);
-    VtableHookEntry* entry = GetOrCreateVtableEntry(vtable);
-    if (vtable[3] != reinterpret_cast<void*>(&Hook_IMMDevice_Activate)) {
-        DWORD oldProtect = 0;
-        if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            if (entry && !entry->origSlot3) {
-                entry->origSlot3 = vtable[3];
-            }
-            if (!g_FallbackActivate) {
-                g_FallbackActivate = reinterpret_cast<PFN_IMMDevice_Activate>(vtable[3]);
-            }
-            vtable[3] = reinterpret_cast<void*>(&Hook_IMMDevice_Activate);
-            VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
-            LogMsg("[Hook] Hooked IMMDevice::Activate at vtable %p (orig=%p)",
-                   vtable, entry ? entry->origSlot3 : nullptr);
-        }
+    IMMDevice* pDevice = nullptr;
+    if (FAILED(pDeviceIn->QueryInterface(IID_IMMDevice_Win7, reinterpret_cast<void**>(&pDevice))) || !pDevice) {
+        pDevice = pDeviceIn;
+        pDevice->AddRef();
     }
-    LeaveCriticalSection(&g_HookLock);
+
+    void** vtable = *reinterpret_cast<void***>(pDevice);
+    if (vtable) {
+        EnterCriticalSection(&g_HookLock);
+        VtableHookEntry* entry = GetOrCreateVtableEntry(vtable);
+        if (vtable[3] != reinterpret_cast<void*>(&Hook_IMMDevice_Activate)) {
+            DWORD oldProtect = 0;
+            if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                if (entry && !entry->origSlot3) {
+                    entry->origSlot3 = vtable[3];
+                }
+                if (!g_FallbackActivate) {
+                    g_FallbackActivate = reinterpret_cast<PFN_IMMDevice_Activate>(vtable[3]);
+                }
+                vtable[3] = reinterpret_cast<void*>(&Hook_IMMDevice_Activate);
+                VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
+                LogMsg("[Hook] Hooked IMMDevice::Activate at vtable %p (orig=%p)",
+                       vtable, entry ? entry->origSlot3 : nullptr);
+            }
+        }
+        LeaveCriticalSection(&g_HookLock);
+    }
+
+    pDevice->Release();
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_IMMDeviceCollection_Item(
@@ -1686,10 +1761,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         DisableThreadLibraryCalls(hModule);
         InitLog();
         AddVectoredExceptionHandler(1, CrashDiagnosticHandler);
-        LogMsg("=== Uncharted 4 Win7 SpatialAudio + IAudioClient2/3 Proxy v3 Loaded (Base=%p) ===", hModule);
+        LogMsg("=== Uncharted 4 Win7 SpatialAudio + IAudioClient2/3 Proxy v4.1 Loaded (Base=%p) ===", hModule);
         InstallCoCreateInstanceHooks();
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        LogMsg("=== Uncharted 4 Win7 Proxy v3 Unloading ===");
+        LogMsg("=== Uncharted 4 Win7 Proxy v4.1 Unloading ===");
     }
     return TRUE;
 }
